@@ -26,19 +26,20 @@ use std::{
 use adw::glib::{self, clone};
 use log::{debug, error, info, warn};
 use pipewire::{
+    context::ContextRc,
+    core::{CoreRc, PW_ID_CORE},
     keys,
-    link::{Link, LinkChangeMask, LinkInfo, LinkListener, LinkState},
-    node::{Node, NodeInfo, NodeListener},
-    port::{Port, PortChangeMask, PortInfo, PortListener},
-    prelude::*,
-    properties,
-    registry::{GlobalObject, Registry},
+    link::{Link, LinkChangeMask, LinkInfoRef, LinkListener, LinkState},
+    main_loop::MainLoopRc,
+    node::{Node, NodeInfoRef, NodeListener},
+    port::{Port, PortChangeMask, PortInfoRef, PortListener},
+    properties::properties,
+    registry::{GlobalObject, RegistryRc},
     spa::{
         param::{ParamInfoFlags, ParamType},
-        ForeignDict, SpaResult,
+        utils::{dict::DictRef, result::SpaResult},
     },
     types::ObjectType,
-    Context, Core, MainLoop,
 };
 
 use crate::{GtkMessage, MediaType, NodeType, PipewireMessage};
@@ -64,17 +65,17 @@ pub(super) fn thread_main(
     gtk_sender: glib::Sender<PipewireMessage>,
     mut pw_receiver: pipewire::channel::Receiver<GtkMessage>,
 ) {
-    let mainloop = MainLoop::new().expect("Failed to create mainloop");
-    let context = Rc::new(Context::new(&mainloop).expect("Failed to create context"));
+    let mainloop = MainLoopRc::new(None).expect("Failed to create mainloop");
+    let context = ContextRc::new(&mainloop, None).expect("Failed to create context");
     let is_stopped = Rc::new(Cell::new(false));
     let mut is_connecting = false;
 
     while !is_stopped.get() {
         // Try to connect
-        let core = match context.connect(Some(properties! {
+        let core = match context.connect_rc(Some(properties! {
             "media.category" => "Manager"
         })) {
-            Ok(core) => Rc::new(core),
+            Ok(core) => core,
             Err(_) => {
                 if !is_connecting {
                     is_connecting = true;
@@ -86,13 +87,13 @@ pub(super) fn thread_main(
                 // If connection is failed, try to connect again in 200ms
                 let interval = Some(Duration::from_millis(200));
 
-                let timer = mainloop.add_timer(clone!(@strong mainloop => move |_| {
+                let timer = mainloop.loop_().add_timer(clone!(@strong mainloop => move |_| {
                     mainloop.quit();
                 }));
 
                 timer.update_timer(interval, None).into_result().unwrap();
 
-                let receiver = pw_receiver.attach(&mainloop, {
+                let receiver = pw_receiver.attach(mainloop.loop_(), {
                     clone!(@strong mainloop, @strong is_stopped => move |msg|
                         if let GtkMessage::Terminate = msg {
                             // main thread requested stop
@@ -116,14 +117,14 @@ pub(super) fn thread_main(
                 .expect("Failed to send message");
         }
 
-        let registry = Rc::new(core.get_registry().expect("Failed to get registry"));
+        let registry = core.get_registry_rc().expect("Failed to get registry");
 
         // Keep proxies and their listeners alive so that we can receive info events.
         let proxies = Rc::new(RefCell::new(HashMap::new()));
         let state = Rc::new(RefCell::new(State::new()));
 
-        let receiver = pw_receiver.attach(&mainloop, {
-            clone!(@strong mainloop, @weak core, @weak registry, @strong state, @strong is_stopped => move |msg| match msg {
+        let receiver = pw_receiver.attach(mainloop.loop_(), {
+            clone!(@strong mainloop, @strong core, @strong registry, @strong state, @strong is_stopped => move |msg| match msg {
                 GtkMessage::ToggleLink { port_from, port_to } => toggle_link(port_from, port_to, &core, &registry, &state),
                 GtkMessage::Terminate => {
                     // main thread requested stop
@@ -136,7 +137,7 @@ pub(super) fn thread_main(
         let gtk_sender = gtk_sender.clone();
         let _listener = core.add_listener_local()
             .error(clone!(@strong mainloop, @strong gtk_sender, @strong is_stopped => move |id, _seq, res, message| {
-                if id != pipewire::PW_ID_CORE {
+                if id != PW_ID_CORE {
                     return;
                 }
 
@@ -153,7 +154,7 @@ pub(super) fn thread_main(
 
         let _listener = registry
             .add_listener_local()
-            .global(clone!(@strong gtk_sender, @weak registry, @strong proxies, @strong state =>
+            .global(clone!(@strong gtk_sender, @strong registry, @strong proxies, @strong state =>
                 move |global| match global.type_ {
                     ObjectType::Node => handle_node(global, &gtk_sender, &registry, &proxies, &state),
                     ObjectType::Port => handle_port(global, &gtk_sender, &registry, &proxies, &state),
@@ -187,19 +188,19 @@ pub(super) fn thread_main(
 }
 
 /// Get the nicest possible name for the node, using a fallback chain of possible name attributes
-fn get_node_name(props: &ForeignDict) -> &str {
+fn get_node_name(props: &DictRef) -> &str {
     props
-        .get(&keys::NODE_DESCRIPTION)
-        .or_else(|| props.get(&keys::NODE_NICK))
-        .or_else(|| props.get(&keys::NODE_NAME))
+        .get(*keys::NODE_DESCRIPTION)
+        .or_else(|| props.get(*keys::NODE_NICK))
+        .or_else(|| props.get(*keys::NODE_NAME))
         .unwrap_or_default()
 }
 
 /// Handle a new node being added
 fn handle_node(
-    node: &GlobalObject<ForeignDict>,
+    node: &GlobalObject<&DictRef>,
     sender: &glib::Sender<PipewireMessage>,
-    registry: &Rc<Registry>,
+    registry: &RegistryRc,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
 ) {
@@ -258,7 +259,7 @@ fn handle_node(
 }
 
 fn handle_node_info(
-    info: &NodeInfo,
+    info: &NodeInfoRef,
     sender: &glib::Sender<PipewireMessage>,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
 ) {
@@ -272,7 +273,7 @@ fn handle_node_info(
     };
 
     let props = info.props().expect("NodeInfo object is missing properties");
-    if let Some(media_name) = props.get(&keys::MEDIA_NAME) {
+    if let Some(media_name) = props.get(*keys::MEDIA_NAME) {
         let name = get_node_name(props).to_string();
 
         sender
@@ -287,9 +288,9 @@ fn handle_node_info(
 
 /// Handle a new port being added
 fn handle_port(
-    port: &GlobalObject<ForeignDict>,
+    port: &GlobalObject<&DictRef>,
     sender: &glib::Sender<PipewireMessage>,
-    registry: &Rc<Registry>,
+    registry: &RegistryRc,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
 ) {
@@ -319,7 +320,7 @@ fn handle_port(
 }
 
 fn handle_port_info(
-    info: &PortInfo,
+    info: &PortInfoRef,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
     sender: &glib::Sender<PipewireMessage>,
@@ -393,9 +394,9 @@ fn handle_port_enum_format(
 
 /// Handle a new link being added
 fn handle_link(
-    link: &GlobalObject<ForeignDict>,
+    link: &GlobalObject<&DictRef>,
     sender: &glib::Sender<PipewireMessage>,
-    registry: &Rc<Registry>,
+    registry: &RegistryRc,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
 ) {
@@ -422,7 +423,7 @@ fn handle_link(
 }
 
 fn handle_link_info(
-    info: &LinkInfo,
+    info: &LinkInfoRef,
     state: &Rc<RefCell<State>>,
     sender: &glib::Sender<PipewireMessage>,
 ) {
@@ -472,8 +473,8 @@ fn handle_link_info(
 fn toggle_link(
     port_from: u32,
     port_to: u32,
-    core: &Rc<Core>,
-    registry: &Rc<Registry>,
+    core: &CoreRc,
+    registry: &RegistryRc,
     state: &Rc<RefCell<State>>,
 ) {
     let state = state.borrow_mut();
@@ -495,7 +496,7 @@ fn toggle_link(
             .get_node_of_port(port_to)
             .expect("Requested port not in state");
 
-        if let Err(e) = core.create_object::<Link, _>(
+        if let Err(e) = core.create_object::<Link>(
             "link-factory",
             &properties! {
                 "link.output.node" => node_from.to_string(),
@@ -510,7 +511,7 @@ fn toggle_link(
     }
 }
 
-fn get_link_media_type(link_info: &LinkInfo) -> MediaType {
+fn get_link_media_type(link_info: &LinkInfoRef) -> MediaType {
     let media_type = link_info
         .format()
         .and_then(|format| pipewire::spa::param::format_utils::parse_format(format).ok())
