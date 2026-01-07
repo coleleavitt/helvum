@@ -16,11 +16,12 @@
 
 use adw::{
     gio,
-    glib::{self, clone, Receiver},
+    glib::{self, clone},
     gtk,
     prelude::*,
     subclass::prelude::*,
 };
+use async_channel::Receiver;
 use pipewire::channel::Sender;
 
 use crate::{graph_manager::GraphManager, ui, GtkMessage, PipewireMessage};

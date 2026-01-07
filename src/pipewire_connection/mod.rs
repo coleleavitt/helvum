@@ -23,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use adw::glib::{self, clone};
+use adw::glib::clone;
 use log::{debug, error, info, warn};
 use pipewire::{
     context::ContextRc,
@@ -62,7 +62,7 @@ enum ProxyItem {
 
 /// The "main" function of the pipewire thread.
 pub(super) fn thread_main(
-    gtk_sender: glib::Sender<PipewireMessage>,
+    gtk_sender: async_channel::Sender<PipewireMessage>,
     mut pw_receiver: pipewire::channel::Receiver<GtkMessage>,
 ) {
     let mainloop = MainLoopRc::new(None).expect("Failed to create mainloop");
@@ -80,7 +80,7 @@ pub(super) fn thread_main(
                 if !is_connecting {
                     is_connecting = true;
                     gtk_sender
-                        .send(PipewireMessage::Connecting)
+                        .send_blocking(PipewireMessage::Connecting)
                         .expect("Failed to send message");
                 }
 
@@ -113,7 +113,7 @@ pub(super) fn thread_main(
         if is_connecting {
             is_connecting = false;
             gtk_sender
-                .send(PipewireMessage::Connected)
+                .send_blocking(PipewireMessage::Connected)
                 .expect("Failed to send message");
         }
 
@@ -142,7 +142,7 @@ pub(super) fn thread_main(
                 }
 
                 if res == -libc::EPIPE {
-                    gtk_sender.send(PipewireMessage::Disconnected)
+                    gtk_sender.try_send(PipewireMessage::Disconnected)
                         .expect("Failed to send message");
                     mainloop.quit();
                 } else {
@@ -166,7 +166,7 @@ pub(super) fn thread_main(
             ))
             .global_remove(clone!(@strong proxies, @strong state => move |id| {
                 if let Some(item) = state.borrow_mut().remove(id) {
-                    gtk_sender.send(match item {
+                    gtk_sender.try_send(match item {
                         Item::Node { .. } => PipewireMessage::NodeRemoved {id},
                         Item::Port { node_id } => PipewireMessage::PortRemoved {id, node_id},
                         Item::Link { .. } => PipewireMessage::LinkRemoved {id},
@@ -199,7 +199,7 @@ fn get_node_name(props: &DictRef) -> &str {
 /// Handle a new node being added
 fn handle_node(
     node: &GlobalObject<&DictRef>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
     registry: &RegistryRc,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
@@ -234,7 +234,7 @@ fn handle_node(
     state.borrow_mut().insert(node.id, Item::Node);
 
     sender
-        .send(PipewireMessage::NodeAdded {
+        .try_send(PipewireMessage::NodeAdded {
             id: node.id,
             name,
             node_type,
@@ -260,7 +260,7 @@ fn handle_node(
 
 fn handle_node_info(
     info: &NodeInfoRef,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
 ) {
     debug!("Received node info: {:?}", info);
@@ -277,7 +277,7 @@ fn handle_node_info(
         let name = get_node_name(props).to_string();
 
         sender
-            .send(PipewireMessage::NodeNameChanged {
+            .try_send(PipewireMessage::NodeNameChanged {
                 id,
                 name,
                 media_name: media_name.to_string(),
@@ -289,7 +289,7 @@ fn handle_node_info(
 /// Handle a new port being added
 fn handle_port(
     port: &GlobalObject<&DictRef>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
     registry: &RegistryRc,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
@@ -323,7 +323,7 @@ fn handle_port_info(
     info: &PortInfoRef,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
 ) {
     debug!("Received port info: {:?}", info);
 
@@ -364,7 +364,7 @@ fn handle_port_info(
         }
 
         sender
-            .send(PipewireMessage::PortAdded {
+            .try_send(PipewireMessage::PortAdded {
                 id,
                 node_id,
                 name,
@@ -377,7 +377,7 @@ fn handle_port_info(
 fn handle_port_enum_format(
     port_id: u32,
     param: Option<&pipewire::spa::pod::Pod>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
 ) {
     let media_type = param
         .and_then(|param| pipewire::spa::param::format_utils::parse_format(param).ok())
@@ -385,7 +385,7 @@ fn handle_port_enum_format(
         .unwrap_or(MediaType::Unknown);
 
     sender
-        .send(PipewireMessage::PortFormatChanged {
+        .try_send(PipewireMessage::PortFormatChanged {
             id: port_id,
             media_type,
         })
@@ -395,7 +395,7 @@ fn handle_port_enum_format(
 /// Handle a new link being added
 fn handle_link(
     link: &GlobalObject<&DictRef>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
     registry: &RegistryRc,
     proxies: &Rc<RefCell<HashMap<u32, ProxyItem>>>,
     state: &Rc<RefCell<State>>,
@@ -425,7 +425,7 @@ fn handle_link(
 fn handle_link_info(
     info: &LinkInfoRef,
     state: &Rc<RefCell<State>>,
-    sender: &glib::Sender<PipewireMessage>,
+    sender: &async_channel::Sender<PipewireMessage>,
 ) {
     debug!("Received link info: {:?}", info);
 
@@ -436,7 +436,7 @@ fn handle_link_info(
         // Info was an update - figure out if we should notify the gtk thread
         if info.change_mask().contains(LinkChangeMask::STATE) {
             sender
-                .send(PipewireMessage::LinkStateChanged {
+                .try_send(PipewireMessage::LinkStateChanged {
                     id,
                     active: matches!(info.state(), LinkState::Active),
                 })
@@ -444,7 +444,7 @@ fn handle_link_info(
         }
         if info.change_mask().contains(LinkChangeMask::FORMAT) {
             sender
-                .send(PipewireMessage::LinkFormatChanged {
+                .try_send(PipewireMessage::LinkFormatChanged {
                     id,
                     media_type: get_link_media_type(info),
                 })
@@ -458,7 +458,7 @@ fn handle_link_info(
         state.insert(id, Item::Link { port_from, port_to });
 
         sender
-            .send(PipewireMessage::LinkAdded {
+            .try_send(PipewireMessage::LinkAdded {
                 id,
                 port_from,
                 port_to,

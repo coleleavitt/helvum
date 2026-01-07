@@ -17,6 +17,7 @@ categories = ["gui", "multimedia"]
 pipewire = "0.9"
 adw = { version = "0.5", package = "libadwaita", features = ["v1_4"] }
 glib = { version = "0.18", features = ["log"] }
+async-channel = "2.3"
 
 log = "0.4.11"
 
